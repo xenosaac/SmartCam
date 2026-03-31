@@ -7,7 +7,7 @@ Hands-free exercise answer scanner. Point your iPhone at a paper exercise sheet,
 1. Your iPhone acts as a webcam via Apple Continuity Camera (no app needed)
 2. `smartcam.py` captures frames every 2 seconds via ffmpeg
 3. Perceptual hashing detects when you flip to a new page
-4. The new page is sent to a vision LLM (Claude or GPT-4o)
+4. The new page is sent to a vision LLM (Claude or GPT-5.4)
 5. Answers appear in an always-on-top window on your Mac
 
 No touching the phone or Mac during operation. Just flip pages.
