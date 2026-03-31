@@ -1,0 +1,6 @@
+.context/
+__pycache__/
+*.pyc
+.env
+venv/
+/tmp/smartcam_*
