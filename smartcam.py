@@ -21,9 +21,10 @@ import sys
 import threading
 import time
 
-import imagehash
+import numpy as np
 import requests
 from PIL import Image
+from skimage.metrics import structural_similarity as ssim
 
 import config
 
@@ -100,25 +101,95 @@ def list_cameras_and_exit():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Persistent camera process (imagesnap -t keeps Continuity Camera alive)
+# ---------------------------------------------------------------------------
+
+_camera_proc = None
+_camera_frame_dir = "/tmp/smartcam_frames"
+
+
+def start_camera_process():
+    """Start imagesnap in time-lapse mode. It keeps the camera open and writes
+    a new JPEG every CAPTURE_INTERVAL seconds."""
+    global _camera_proc
+    os.makedirs(_camera_frame_dir, exist_ok=True)
+    # Clean old frames
+    for f in os.listdir(_camera_frame_dir):
+        os.remove(os.path.join(_camera_frame_dir, f))
+
+    _camera_proc = subprocess.Popen(
+        [
+            "imagesnap", "-t", str(config.CAPTURE_INTERVAL),
+            "-w", "1.0",
+            os.path.join(_camera_frame_dir, "frame"),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    logger.info("Camera process started (PID %d)", _camera_proc.pid)
+
+
+def stop_camera_process():
+    """Stop the persistent camera process."""
+    global _camera_proc
+    if _camera_proc and _camera_proc.poll() is None:
+        _camera_proc.terminate()
+        _camera_proc.wait(timeout=5)
+        logger.info("Camera process stopped")
+    _camera_proc = None
+
+
 def capture_frame(device_index: int) -> Image.Image | None:
-    """Capture a single frame via ffmpeg. Returns PIL Image or None on failure."""
-    try:
-        result = subprocess.run(
-            [
-                "ffmpeg", "-f", "avfoundation",
-                "-i", str(device_index),
-                "-frames:v", "1",
-                "-y", config.FRAME_PATH,
-            ],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode != 0:
-            if "permission" in result.stderr.lower() or "denied" in result.stderr.lower():
-                return "PERMISSION_DENIED"
+    """Read the latest frame written by the persistent imagesnap process."""
+    global _camera_proc
+
+    # Start camera process if not running
+    if _camera_proc is None or _camera_proc.poll() is not None:
+        try:
+            start_camera_process()
+            time.sleep(2)  # wait for first frame
+        except FileNotFoundError:
+            logger.error("imagesnap not found. Install: brew install imagesnap")
             return None
-        return Image.open(config.FRAME_PATH)
-    except subprocess.TimeoutExpired:
+
+    # Find the latest frame file that we haven't already processed
+    try:
+        files = sorted(
+            [f for f in os.listdir(_camera_frame_dir) if f.startswith("frame")],
+            key=lambda f: os.path.getmtime(os.path.join(_camera_frame_dir, f)),
+        )
+    except OSError:
         return None
+
+    if not files:
+        return None
+
+    latest = os.path.join(_camera_frame_dir, files[-1])
+
+    # Skip if we already processed this exact file
+    last_file = getattr(capture_frame, "_last_file", None)
+    if latest == last_file:
+        # Wait for a new frame from imagesnap
+        return "SAME_FRAME"
+
+    try:
+        age = time.time() - os.path.getmtime(latest)
+        if age > config.CAPTURE_INTERVAL * 5:
+            return None  # stale frame, camera may have stopped
+
+        img = Image.open(latest)
+        img.load()  # force read before file gets overwritten
+        capture_frame._last_file = latest
+
+        # Clean up old frames (keep only last 3)
+        for f in files[:-3]:
+            try:
+                os.remove(os.path.join(_camera_frame_dir, f))
+            except OSError:
+                pass
+
+        return img
     except Exception:
         return None
 
@@ -251,140 +322,133 @@ def _call_openai_compatible(url: str, api_key: str, model: str, messages: list) 
 
 
 def capture_loop(answer_queue: queue.Queue, shutdown: threading.Event):
-    """Main capture loop running in a background thread."""
+    """Main capture loop. Simple state machine:
+
+    1. Grab latest frame
+    2. If content changed from last sent: wait one more frame to confirm (debounce)
+    3. Send to LLM, display answer
+    4. Immediately check if content changed AGAIN while LLM was thinking
+    5. If yes, send the new content right away (no extra debounce wait)
+    """
     camera_index = getattr(capture_loop, "camera_index", 0)
-    last_sent_hash = None
-    pending_hash = None       # hash of first changed frame (for debounce)
-    api_in_flight = False
-    discard_pending = False
+    last_sent_gray = None  # grayscale numpy array of last sent frame
 
     logger.info("Capture loop started (camera index %d)", camera_index)
 
+    loop_count = 0
     while not shutdown.is_set():
-        # Capture
-        result = capture_frame(camera_index)
+        loop_count += 1
 
-        if result == "PERMISSION_DENIED":
-            answer_queue.put(
-                "Camera permission needed.\n"
-                "Grant in System Settings > Privacy & Security > Camera"
-            )
-            logger.error("Camera permission denied")
-            shutdown.wait(5)
+        # --- Step 1: Get a fresh frame ---
+        img = _get_frame(camera_index, answer_queue, shutdown)
+        if img is None or shutdown.is_set():
             continue
 
-        if result is None:
-            # Camera may have disconnected — re-discover
-            logger.warning("Capture failed — re-discovering cameras")
-            answer_queue.put("Camera disconnected — reconnecting...")
-            cameras = discover_cameras()
-            new_idx = find_iphone_camera(cameras)
-            if new_idx is not None:
-                camera_index = new_idx
-                logger.info("Re-discovered camera at index %d", camera_index)
-            shutdown.wait(5)
-            continue
-
-        img = result
-
-        # Quality gate: brightness
         if not check_brightness(img):
             answer_queue.put("Waiting for clear image...")
             shutdown.wait(config.CAPTURE_INTERVAL)
             continue
 
-        # Change detection
-        current_hash = imagehash.average_hash(img)
+        # Convert to small grayscale for fast SSIM comparison
+        small = img.resize((320, 240), Image.LANCZOS).convert("L")
+        current_gray = np.array(small)
 
-        if last_sent_hash is not None:
-            distance = current_hash - last_sent_hash
-            if distance < config.HASH_THRESHOLD:
-                # No change
+        # --- Step 2: Check if content changed (SSIM) ---
+        if last_sent_gray is not None:
+            score = ssim(last_sent_gray, current_gray)
+            if score > config.SSIM_THRESHOLD:
+                # No meaningful change
+                if loop_count % 20 == 0:
+                    logger.info("[loop %d] No change (SSIM=%.3f)", loop_count, score)
                 shutdown.wait(config.CAPTURE_INTERVAL)
                 continue
-            else:
-                # Change detected
-                if pending_hash is None:
-                    # First changed frame — start debounce
-                    pending_hash = current_hash
-                    logger.info(
-                        "Page change detected (distance=%d), waiting for settle...",
-                        distance,
-                    )
-                    shutdown.wait(config.CAPTURE_INTERVAL)
-                    continue
-                else:
-                    # Second frame — check if settled
-                    debounce_dist = current_hash - pending_hash
-                    if debounce_dist > config.DEBOUNCE_SIMILARITY:
-                        # Still changing — reset debounce
-                        pending_hash = current_hash
-                        shutdown.wait(config.CAPTURE_INTERVAL)
-                        continue
-                    # Settled! Proceed to API call
-                    logger.info("Page settled (debounce_dist=%d)", debounce_dist)
-                    pending_hash = None
-        else:
-            # First frame ever — send it
-            logger.info("First frame captured, sending to LLM")
+            logger.info("[loop %d] PAGE CHANGE (SSIM=%.3f)", loop_count, score)
 
-        # Backpressure: if API call is in flight, mark for discard
-        if api_in_flight:
-            discard_pending = True
-            logger.info("API call in flight — will discard stale response")
+            # Debounce: grab one more frame, confirm it's stable
             shutdown.wait(config.CAPTURE_INTERVAL)
-            continue
+            if shutdown.is_set():
+                break
+            img2 = _get_frame(camera_index, answer_queue, shutdown)
+            if img2 is None:
+                continue
+            small2 = img2.resize((320, 240), Image.LANCZOS).convert("L")
+            gray2 = np.array(small2)
+            settle_score = ssim(current_gray, gray2)
+            if settle_score < config.SSIM_SETTLE:
+                # Still changing
+                logger.info("[loop %d] Still changing (settle=%.3f)", loop_count, settle_score)
+                continue
+            img = img2
+            current_gray = gray2
+            logger.info("[loop %d] Page settled (settle=%.3f)", loop_count, settle_score)
+        else:
+            logger.info("[loop %d] First frame ever", loop_count)
 
-        # Resize and encode
+        # --- Step 3: Send to LLM ---
+        logger.info("[loop %d] Sending to LLM...", loop_count)
+        answer_queue.put("Analyzing...")
         resized = resize_for_api(img)
         b64 = image_to_base64(resized)
 
-        # API call
-        api_in_flight = True
         t0 = time.time()
         try:
             answer = call_llm(b64)
             elapsed = time.time() - t0
-            logger.info("LLM response received (%.1fs)", elapsed)
-
-            if discard_pending:
-                logger.info("Discarding stale response")
-                discard_pending = False
-            else:
-                last_sent_hash = current_hash
-                answer_queue.put(answer)
-        except requests.exceptions.Timeout:
-            logger.warning("API call timed out — retrying once")
-            try:
-                answer = call_llm(b64)
-                elapsed = time.time() - t0
-                logger.info("LLM retry response received (%.1fs)", elapsed)
-                if not discard_pending:
-                    last_sent_hash = current_hash
-                    answer_queue.put(answer)
-                discard_pending = False
-            except Exception as e:
-                logger.error("API retry failed: %s", e)
-                answer_queue.put(f"LLM unavailable — check backend\n({e})")
-                discard_pending = False
-        except requests.exceptions.HTTPError as e:
-            logger.error("API error: %s", e)
-            try:
-                body = e.response.text
-            except Exception:
-                body = str(e)
-            answer_queue.put(f"LLM error:\n{body}")
-            discard_pending = False
+            logger.info("[loop %d] LLM RESPONSE (%.1fs): %s...", loop_count, elapsed, answer[:80])
+            last_sent_gray = current_gray
+            answer_queue.put(answer)
+            logger.info("[loop %d] Answer pushed to queue (qsize=%d)", loop_count, answer_queue.qsize())
         except Exception as e:
-            logger.error("Unexpected API error: %s", e)
-            answer_queue.put(f"LLM unavailable — check backend\n({e})")
-            discard_pending = False
-        finally:
-            api_in_flight = False
+            logger.error("[loop %d] LLM ERROR: %s", loop_count, e)
+            body = ""
+            if hasattr(e, "response"):
+                try:
+                    body = e.response.text
+                except Exception:
+                    pass
+            answer_queue.put(f"LLM error:\n{body or e}")
+            last_sent_gray = current_gray
+            shutdown.wait(config.CAPTURE_INTERVAL)
+            continue
+
+        # Step 4: No immediate re-check. Let the next loop iteration handle
+        # any new page changes naturally. This prevents "answer flashing"
+        # where camera shake (distance 4-8) triggers an immediate re-send.
+        logger.info("[loop %d] Answer displayed, waiting for next cycle", loop_count)
 
         shutdown.wait(config.CAPTURE_INTERVAL)
 
     logger.info("Capture loop stopped")
+
+
+def _get_frame(camera_index, answer_queue, shutdown):
+    """Helper: grab a frame, handle errors. Returns Image or None."""
+    result = capture_frame(camera_index)
+
+    if result == "PERMISSION_DENIED":
+        answer_queue.put(
+            "Camera permission needed.\n"
+            "Grant in System Settings > Privacy & Security > Camera"
+        )
+        shutdown.wait(5)
+        return None
+
+    if result == "SAME_FRAME":
+        # Don't log every SAME_FRAME (too noisy), just wait
+        shutdown.wait(0.5)
+        return None
+
+    if result is None:
+        logger.warning("Capture failed — re-discovering cameras")
+        cameras = discover_cameras()
+        new_idx = find_iphone_camera(cameras)
+        if new_idx is not None:
+            capture_loop.camera_index = new_idx
+            logger.info("Re-discovered camera at index %d", new_idx)
+        shutdown.wait(3)
+        return None
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -393,45 +457,70 @@ def capture_loop(answer_queue: queue.Queue, shutdown: threading.Event):
 
 
 def run_display(answer_queue: queue.Queue, shutdown: threading.Event):
-    """Run the PyQt6 always-on-top answer window."""
+    """Run the PyQt6 always-on-top answer window with live camera preview."""
     from PyQt6.QtCore import Qt, QTimer
-    from PyQt6.QtGui import QFont
+    from PyQt6.QtGui import QFont, QPixmap, QImage
     from PyQt6.QtWidgets import (
-        QApplication, QLabel, QScrollArea, QVBoxLayout, QWidget,
+        QApplication, QLabel, QScrollArea, QHBoxLayout, QVBoxLayout, QWidget,
+        QSplitter, QFrame,
     )
 
     app = QApplication(sys.argv)
 
+    WINDOW_W = 900
+    WINDOW_H = 500
+
     # Main window
     window = QWidget()
     window.setWindowTitle("Smart_Cam")
-    window.setWindowFlags(
-        Qt.WindowType.WindowStaysOnTopHint
-        | Qt.WindowType.FramelessWindowHint
-        | Qt.WindowType.Tool
-    )
-    window.setFixedSize(config.DISPLAY_WIDTH, config.DISPLAY_HEIGHT)
-    window.setStyleSheet(
-        f"background-color: {config.DISPLAY_BG};"
-        f"border-radius: 12px;"
-    )
+    window.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
+    window.resize(WINDOW_W, WINDOW_H)
+    window.setStyleSheet(f"background-color: {config.DISPLAY_BG};")
     window.setWindowOpacity(config.DISPLAY_OPACITY)
 
-    # Layout
-    layout = QVBoxLayout(window)
-    layout.setContentsMargins(16, 16, 16, 16)
+    # Horizontal layout: camera preview (left) | answers (right)
+    main_layout = QHBoxLayout(window)
+    main_layout.setContentsMargins(8, 8, 8, 8)
+    main_layout.setSpacing(8)
 
-    # Title bar (for dragging)
-    title = QLabel("Smart_Cam")
-    title.setStyleSheet("color: #666; font-size: 11px; padding-bottom: 4px;")
-    title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    layout.addWidget(title)
+    # --- Left panel: camera preview ---
+    preview_frame = QFrame()
+    preview_frame.setStyleSheet(
+        "QFrame { background-color: #111; border: 1px solid #333; border-radius: 6px; }"
+    )
+    preview_layout = QVBoxLayout(preview_frame)
+    preview_layout.setContentsMargins(4, 4, 4, 4)
 
-    # Scrollable answer area
+    preview_title = QLabel("Camera Preview")
+    preview_title.setStyleSheet("color: #888; font-size: 11px; border: none;")
+    preview_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    preview_layout.addWidget(preview_title)
+
+    preview_label = QLabel("Waiting for camera...")
+    preview_label.setStyleSheet("color: #555; border: none;")
+    preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    preview_label.setMinimumSize(350, 280)
+    preview_layout.addWidget(preview_label)
+
+    main_layout.addWidget(preview_frame, stretch=1)
+
+    # --- Right panel: answers ---
+    answer_frame = QFrame()
+    answer_frame.setStyleSheet(
+        "QFrame { background-color: #1a1a1a; border: 1px solid #333; border-radius: 6px; }"
+    )
+    answer_layout = QVBoxLayout(answer_frame)
+    answer_layout.setContentsMargins(4, 4, 4, 4)
+
+    answer_title = QLabel("Answers")
+    answer_title.setStyleSheet("color: #888; font-size: 11px; border: none;")
+    answer_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    answer_layout.addWidget(answer_title)
+
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
     scroll.setStyleSheet(
-        "QScrollArea { border: none; }"
+        "QScrollArea { border: none; background: transparent; }"
         "QScrollBar:vertical { width: 6px; background: transparent; }"
         "QScrollBar::handle:vertical { background: #555; border-radius: 3px; }"
     )
@@ -439,43 +528,81 @@ def run_display(answer_queue: queue.Queue, shutdown: threading.Event):
     answer_label = QLabel("Starting... Point your camera at an exercise sheet.")
     answer_label.setWordWrap(True)
     answer_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-    answer_label.setFont(QFont("SF Mono, Menlo, monospace", config.DISPLAY_FONT_SIZE))
-    answer_label.setStyleSheet("color: #e0e0e0; padding: 8px;")
+    answer_label.setFont(QFont("Menlo", config.DISPLAY_FONT_SIZE))
+    answer_label.setStyleSheet("color: #e0e0e0; padding: 8px; border: none;")
     answer_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
     scroll.setWidget(answer_label)
-    layout.addWidget(scroll)
+    answer_layout.addWidget(scroll)
 
-    # Position: bottom-right corner
-    from PyQt6.QtWidgets import QApplication as QApp
-    screen = QApp.primaryScreen()
+    main_layout.addWidget(answer_frame, stretch=1)
+
+    # Position: right side of screen
+    screen = QApplication.primaryScreen()
     if screen:
         geo = screen.availableGeometry()
         window.move(
-            geo.right() - config.DISPLAY_WIDTH - 20,
-            geo.bottom() - config.DISPLAY_HEIGHT - 20,
+            geo.right() - WINDOW_W - 20,
+            geo.bottom() - WINDOW_H - 20,
         )
 
     window.show()
 
-    # Poll queue for new answers
+    # --- Update camera preview ---
+    def update_preview():
+        """Load the latest frame from disk and display it."""
+        try:
+            files = sorted(
+                [f for f in os.listdir(_camera_frame_dir) if f.startswith("frame")],
+                key=lambda f: os.path.getmtime(os.path.join(_camera_frame_dir, f)),
+            )
+            if not files:
+                return
+            latest = os.path.join(_camera_frame_dir, files[-1])
+            pixmap = QPixmap(latest)
+            if not pixmap.isNull():
+                scaled = pixmap.scaled(
+                    preview_label.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                preview_label.setPixmap(scaled)
+        except Exception:
+            pass
+
+    # --- Poll queue for new answers ---
     def check_queue():
+        latest_text = None
+        count = 0
         try:
             while True:
-                text = answer_queue.get_nowait()
-                answer_label.setText(text)
-                # Chime on new real answer (not status messages)
-                if not text.startswith(("Waiting", "Camera", "Starting", "LLM")):
-                    os.system('afplay /System/Library/Sounds/Glass.aiff &')
+                latest_text = answer_queue.get_nowait()
+                count += 1
         except queue.Empty:
             pass
+
+        if latest_text is not None:
+            logger.info("[DISPLAY] Updating answer (picked %d items from queue, showing last)", count)
+            logger.info("[DISPLAY] Text preview: %s...", latest_text[:80])
+            answer_label.setText(latest_text)
+            answer_label.adjustSize()
+            answer_label.repaint()
+            scroll.verticalScrollBar().setValue(0)
+            if not latest_text.startswith(("Waiting", "Camera", "Starting", "LLM", "Analyzing")):
+                os.system('afplay /System/Library/Sounds/Glass.aiff &')
 
         if shutdown.is_set():
             app.quit()
 
-    timer = QTimer()
-    timer.timeout.connect(check_queue)
-    timer.start(100)
+    # Timer for answers (100ms)
+    answer_timer = QTimer()
+    answer_timer.timeout.connect(check_queue)
+    answer_timer.start(100)
+
+    # Timer for camera preview (500ms)
+    preview_timer = QTimer()
+    preview_timer.timeout.connect(update_preview)
+    preview_timer.start(500)
 
     # Handle Ctrl-C
     signal.signal(signal.SIGINT, lambda *_: shutdown.set())
@@ -553,6 +680,7 @@ def main():
         pass
     finally:
         shutdown_event.set()
+        stop_camera_process()
         capture_thread.join(timeout=5)
         # Cleanup temp files
         for f in [config.FRAME_PATH]:
@@ -560,6 +688,8 @@ def main():
                 os.remove(f)
             except OSError:
                 pass
+        import shutil
+        shutil.rmtree(_camera_frame_dir, ignore_errors=True)
         logger.info("Smart_Cam stopped")
 
 

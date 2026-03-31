@@ -3,4 +3,6 @@ __pycache__/
 *.pyc
 .env
 venv/
-/tmp/smartcam_*
+*.egg-info/
+.pytest_cache/
+.gstack/
