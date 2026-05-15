@@ -1,17 +1,20 @@
 # Smart_Cam Configuration
 # Edit this file to configure your backend and capture settings.
 
-# Backend configuration — pick ONE by setting BACKEND
-BACKEND = "cliproxyapi"                    # "anthropic", "openai", or "cliproxyapi"
+import os
 
-ANTHROPIC_API_KEY = ""                     # from console.anthropic.com (paid, reliable)
+# Backend configuration — pick ONE by setting BACKEND
+BACKEND = "openai"                         # "anthropic", "openai", or "cliproxyapi"
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
 
-OPENAI_API_KEY = ""                        # from platform.openai.com (paid, reliable)
-OPENAI_MODEL = "gpt-4o"
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = "gpt-5.5"
+OPENAI_REASONING_EFFORT = "medium"          # gpt-5.x only: minimal | low | medium | high
 
 CLIPROXYAPI_URL = "http://localhost:8080"   # unofficial proxy (free, may break)
-CLIPROXYAPI_MODEL = "gpt-5.4"
+CLIPROXYAPI_MODEL = "claude-opus-4-6"
 
 # Capture settings
 CAPTURE_INTERVAL = 2                       # seconds between frame captures

@@ -24,9 +24,15 @@ import time
 import numpy as np
 import requests
 from PIL import Image
-from skimage.metrics import structural_similarity as ssim
 
 import config
+
+
+def _ssim(a, b):
+    # Lazy import: skimage triggers a large scipy load cascade (30-90s cold).
+    # Keep CLI paths like --list-cameras fast.
+    from skimage.metrics import structural_similarity
+    return structural_similarity(a, b)
 
 # ---------------------------------------------------------------------------
 # Logging — state transitions only, not per-frame spam
@@ -302,14 +308,22 @@ def _call_anthropic(image_b64: str) -> str:
 
 def _call_openai_compatible(url: str, api_key: str, model: str, messages: list) -> str:
     """Call any OpenAI-compatible API."""
+    payload: dict = {"model": model, "messages": messages}
+    if model.startswith("gpt-5"):
+        payload["max_completion_tokens"] = 4096
+        effort = getattr(config, "OPENAI_REASONING_EFFORT", None)
+        if effort:
+            payload["reasoning_effort"] = effort
+    else:
+        payload["max_tokens"] = 4096
     resp = requests.post(
         url,
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
-        json={"model": model, "messages": messages, "max_tokens": 4096},
-        timeout=60,
+        json=payload,
+        timeout=120,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -355,7 +369,7 @@ def capture_loop(answer_queue: queue.Queue, shutdown: threading.Event):
 
         # --- Step 2: Check if content changed (SSIM) ---
         if last_sent_gray is not None:
-            score = ssim(last_sent_gray, current_gray)
+            score = _ssim(last_sent_gray, current_gray)
             if score > config.SSIM_THRESHOLD:
                 # No meaningful change
                 if loop_count % 20 == 0:
@@ -373,7 +387,7 @@ def capture_loop(answer_queue: queue.Queue, shutdown: threading.Event):
                 continue
             small2 = img2.resize((320, 240), Image.LANCZOS).convert("L")
             gray2 = np.array(small2)
-            settle_score = ssim(current_gray, gray2)
+            settle_score = _ssim(current_gray, gray2)
             if settle_score < config.SSIM_SETTLE:
                 # Still changing
                 logger.info("[loop %d] Still changing (settle=%.3f)", loop_count, settle_score)
